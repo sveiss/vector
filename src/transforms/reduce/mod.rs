@@ -14,6 +14,7 @@ use std::{
     pin::Pin,
     time::{Duration, Instant},
 };
+use vector_core::ByteSizeOf;
 
 mod merge_strategy;
 
@@ -25,6 +26,7 @@ use merge_strategy::*;
 #[serde(deny_unknown_fields, default)]
 pub struct ReduceConfig {
     pub expire_after_ms: Option<u64>,
+    pub expire_after_max_bytes: Option<u64>,
 
     pub flush_period_ms: Option<u64>,
 
@@ -71,15 +73,18 @@ impl TransformConfig for ReduceConfig {
 #[derive(Debug)]
 struct ReduceState {
     fields: HashMap<String, Box<dyn ReduceValueMerger>>,
+    bytes_seen: u64,
     stale_since: Instant,
     metadata: EventMetadata,
 }
 
 impl ReduceState {
     fn new(e: LogEvent, strategies: &IndexMap<String, MergeStrategy>) -> Self {
+        let bytes_seen = e.allocated_bytes() as u64;
         let (fields, metadata) = e.into_parts();
         Self {
             stale_since: Instant::now(),
+            bytes_seen: bytes_seen,
             fields: fields
                 .into_iter()
                 .filter_map(|(k, v)| {
@@ -101,6 +106,8 @@ impl ReduceState {
     }
 
     fn add_event(&mut self, e: LogEvent, strategies: &IndexMap<String, MergeStrategy>) {
+        self.bytes_seen += e.allocated_bytes() as u64;
+
         let (fields, metadata) = e.into_parts();
         self.metadata.merge(metadata);
 
@@ -146,6 +153,7 @@ impl ReduceState {
 
 pub struct Reduce {
     expire_after: Duration,
+    expire_after_max_bytes: u64,
     flush_period: Duration,
     group_by: Vec<String>,
     merge_strategies: IndexMap<String, MergeStrategy>,
@@ -177,6 +185,7 @@ impl Reduce {
 
         Ok(Reduce {
             expire_after: Duration::from_millis(config.expire_after_ms.unwrap_or(30000)),
+            expire_after_max_bytes: config.expire_after_max_bytes.unwrap_or(30000),
             flush_period: Duration::from_millis(config.flush_period_ms.unwrap_or(1000)),
             group_by,
             merge_strategies: config.merge_strategies.clone(),
@@ -189,7 +198,8 @@ impl Reduce {
     fn flush_into(&mut self, output: &mut Vec<Event>) {
         let mut flush_discriminants = Vec::new();
         for (k, t) in &self.reduce_merge_states {
-            if t.stale_since.elapsed() >= self.expire_after {
+            if t.stale_since.elapsed() >= self.expire_after ||
+                t.bytes_seen >= self.expire_after_max_bytes {
                 flush_discriminants.push(k.clone());
             }
         }
@@ -559,6 +569,67 @@ merge_strategies.bar = "concat"
         let output_2 = out_stream.next().await.unwrap().into_log();
         assert_eq!(output_2["foo"], json!([[2, 4], [6, 8], "done"]).into());
         assert_eq!(output_2["bar"], json!([2, 4, 6, 8, "done"]).into());
+        assert_eq!(output_2.metadata(), &metadata_2);
+    }
+
+    #[tokio::test]
+    async fn max_bytes() {
+        let reduce = toml::from_str::<ReduceConfig>(
+            r#"
+group_by = [ "request_id" ]
+expire_after_max_bytes = 40
+
+merge_strategies.message = "concat"
+
+[ends_when]
+  type = "check_fields"
+  "test_end.exists" = true
+"#,
+        )
+        .unwrap()
+        .build(&TransformContext::default())
+        .await
+        .unwrap();
+        let reduce = reduce.into_task();
+
+        let mut e_1 = LogEvent::from("test message 1");
+        e_1.insert("counter", 1);
+        e_1.insert("request_id", "1");
+        let metadata_1 = e_1.metadata().clone();
+
+        let mut e_2 = LogEvent::from("test message 2");
+        e_2.insert("counter", 2);
+        e_2.insert("request_id", "2");
+        let metadata_2 = e_2.metadata().clone();
+
+        let mut e_3 = LogEvent::from("test message 3 is really long and should trigger a flush");
+        e_3.insert("counter", 3);
+        e_3.insert("request_id", "1");
+
+        let mut e_4 = LogEvent::from("test message 3 should start a new event");
+        e_4.insert("counter", 4);
+        e_4.insert("request_id", "1");
+        e_4.insert("test_end", "yep");
+
+        let mut e_5 = LogEvent::from("test message 5");
+        e_5.insert("counter", 5);
+        e_5.insert("request_id", "2");
+        e_5.insert("extra_field", "value1");
+        e_5.insert("test_end", "yep");
+
+        let inputs = vec![e_1.into(), e_2.into(), e_3.into(), e_4.into(), e_5.into()];
+        let in_stream = Box::pin(stream::iter(inputs));
+        let mut out_stream = reduce.transform(in_stream);
+
+        let output_1 = out_stream.next().await.unwrap().into_log();
+        assert_eq!(output_1["message"], "test message 1test message 3 is really long and should trigger a flush".into());
+        assert_eq!(output_1["counter"], Value::from(8));
+        assert_eq!(output_1.metadata(), &metadata_1);
+
+        let output_2 = out_stream.next().await.unwrap().into_log();
+        assert_eq!(output_2["message"], "test message 2test message 5".into());
+        assert_eq!(output_2["extra_field"], "value1".into());
+        assert_eq!(output_2["counter"], Value::from(7));
         assert_eq!(output_2.metadata(), &metadata_2);
     }
 }
