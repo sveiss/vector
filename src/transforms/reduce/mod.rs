@@ -81,6 +81,7 @@ struct ReduceState {
 impl ReduceState {
     fn new(e: LogEvent, strategies: &IndexMap<String, MergeStrategy>) -> Self {
         let bytes_seen = e.allocated_bytes() as u64;
+        println!("new message: bytes_seen={}", bytes_seen);
         let (fields, metadata) = e.into_parts();
         Self {
             stale_since: Instant::now(),
@@ -107,6 +108,7 @@ impl ReduceState {
 
     fn add_event(&mut self, e: LogEvent, strategies: &IndexMap<String, MergeStrategy>) {
         self.bytes_seen += e.allocated_bytes() as u64;
+        println!("add message: bytes_seen={}", self.bytes_seen);
 
         let (fields, metadata) = e.into_parts();
         self.metadata.merge(metadata);
@@ -145,6 +147,7 @@ impl ReduceState {
                 warn!(message = "Failed to merge values for field.", %error);
             }
         }
+        self.bytes_seen = 0;
         event
     }
 }
@@ -196,11 +199,14 @@ impl Reduce {
     }
 
     fn flush_into(&mut self, output: &mut Vec<Event>) {
+        println!("doin a flush_into");
         let mut flush_discriminants = Vec::new();
         for (k, t) in &self.reduce_merge_states {
-            if t.stale_since.elapsed() >= self.expire_after ||
-                t.bytes_seen >= self.expire_after_max_bytes {
-                flush_discriminants.push(k.clone());
+            if t.stale_since.elapsed() >= self.expire_after {
+                flush_discriminants.push(k.clone()); // TODO: track flush reason
+            } else if t.bytes_seen >= self.expire_after_max_bytes {
+                flush_discriminants.push(k.clone()); // TODO: track flush reason
+                println!("expired due to bytes_seen");
             }
         }
         for k in &flush_discriminants {
@@ -577,7 +583,7 @@ merge_strategies.bar = "concat"
         let reduce = toml::from_str::<ReduceConfig>(
             r#"
 group_by = [ "request_id" ]
-expire_after_max_bytes = 40
+expire_after_max_bytes = 1024
 
 merge_strategies.message = "concat"
 
@@ -603,33 +609,43 @@ merge_strategies.message = "concat"
         let metadata_2 = e_2.metadata().clone();
 
         let mut e_3 = LogEvent::from("test message 3 is really long and should trigger a flush");
+        e_3.insert("big_chunk_bad", "abc".repeat(1024));
         e_3.insert("counter", 3);
         e_3.insert("request_id", "1");
 
-        let mut e_4 = LogEvent::from("test message 3 should start a new event");
+        let mut e_4 = LogEvent::from("test message 4 should start a new event");
         e_4.insert("counter", 4);
         e_4.insert("request_id", "1");
-        e_4.insert("test_end", "yep");
 
         let mut e_5 = LogEvent::from("test message 5");
         e_5.insert("counter", 5);
-        e_5.insert("request_id", "2");
-        e_5.insert("extra_field", "value1");
+        e_5.insert("request_id", "1");
         e_5.insert("test_end", "yep");
 
-        let inputs = vec![e_1.into(), e_2.into(), e_3.into(), e_4.into(), e_5.into()];
+        let mut e_6 = LogEvent::from("test message 6");
+        e_6.insert("counter", 6);
+        e_6.insert("request_id", "2");
+        e_6.insert("extra_field", "value1");
+        e_6.insert("test_end", "yep");
+
+        let inputs = vec![e_1.into(), e_2.into(), e_3.into(), e_4.into(), e_5.into(), e_6.into()];
         let in_stream = Box::pin(stream::iter(inputs));
         let mut out_stream = reduce.transform(in_stream);
 
         let output_1 = out_stream.next().await.unwrap().into_log();
-        assert_eq!(output_1["message"], "test message 1test message 3 is really long and should trigger a flush".into());
-        assert_eq!(output_1["counter"], Value::from(8));
+        assert_eq!(output_1["message"], "test message 1 test message 3 is really long and should trigger a flush".into());
+        assert_eq!(output_1["counter"], Value::from(4));
+        assert_eq!(output_1.metadata(), &metadata_1);
+
+        let output_1 = out_stream.next().await.unwrap().into_log();
+        assert_eq!(output_1["message"], "test message 4 should start a new event test message 5".into());
+        assert_eq!(output_1["counter"], Value::from(9));
         assert_eq!(output_1.metadata(), &metadata_1);
 
         let output_2 = out_stream.next().await.unwrap().into_log();
-        assert_eq!(output_2["message"], "test message 2test message 5".into());
+        assert_eq!(output_2["message"], "test message 2 test message 6".into());
         assert_eq!(output_2["extra_field"], "value1".into());
-        assert_eq!(output_2["counter"], Value::from(7));
+        assert_eq!(output_2["counter"], Value::from(8));
         assert_eq!(output_2.metadata(), &metadata_2);
     }
 }
