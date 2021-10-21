@@ -63,10 +63,11 @@ This is ideal for users who want it to "Just work" and just want to start contri
 export CONTAINER_TOOL="podman"
 ```
 
-By default, `make environment` style tasks will do a `docker pull` from Github's container repository, you can **optionally** build your own environment while you make your morning coffee ☕:
+Ideally, `make environment` style tasks will would do a `docker pull` from Github's container repository, or you would have the choice to **optionally** build your own environment while you make your morning coffee ☕.
+
+Unfortunately, pulling a pre-built environment is currently disabled due to a requirement for  Github authentication, so you'll need that coffee either way.
 
 ```bash
-# Optional: Only if you want to go make a coffee
 make environment-prepare
 ```
 
@@ -136,19 +137,19 @@ cargo build
 make build-dev
 # Validate your test pass
 cargo test sources::example
-make test scope="sources::example"
+make test SCOPE="sources::example"
 # Validate tests (that do not require other services) pass
 cargo test
 make test
 # Validate your tests pass (starting required services in Docker)
-make test-integration scope="sources::example"
+make test-integration SCOPE="sources::example"
 # Validate your tests pass against a live service.
-make test-integration scope="sources::example" autospawn=false
+make test-integration SCOPE="sources::example" autospawn=false
 cargo test --features docker sources::example
 # Validate all tests pass (starting required services in Docker)
 make test-integration
 # Run your benchmarks
-make bench scope="transforms::example"
+make bench SCOPE="transforms::example"
 cargo bench transforms::example
 # Format your code before pushing!
 make fmt
